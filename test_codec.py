@@ -11,7 +11,7 @@ import struct
 import zlib
 
 from bmp_codec import BmpImage, bmp_encode, bmp_decode
-from png_codec import PngImage, png_encode, png_decode
+from png_codec import PngImage, png_encode, png_decode, png_write_file, png_read_file
 from deflate import zlib_compress, zlib_decompress
 
 
@@ -1062,6 +1062,316 @@ def test_png_standard_zlib_compressed_read_all_filters():
     print("  PASSED\n")
 
 
+def _verify_png_file_zlib(filepath, expected_img, expected_palette=None):
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    assert data[:8] == b'\x89PNG\r\n\x1a\n', "Invalid PNG signature in file"
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    idat_data = bytearray()
+    palette = []
+
+    while pos < len(data):
+        cl = struct.unpack('>I', data[pos:pos + 4])[0]
+        ct = data[pos + 4:pos + 8]
+        cd = data[pos + 8:pos + 8 + cl]
+        crc_stored = struct.unpack('>I', data[pos + 8 + cl:pos + 12 + cl])[0]
+        crc_computed = zlib.crc32(ct + cd) & 0xFFFFFFFF
+        assert crc_computed == crc_stored, (
+            "Chunk %s CRC mismatch: stored=0x%08X computed=0x%08X" % (ct, crc_stored, crc_computed))
+
+        if ct == b'IHDR':
+            width = struct.unpack('>I', cd[0:4])[0]
+            height = struct.unpack('>I', cd[4:8])[0]
+            bit_depth = cd[8]
+            color_type = cd[9]
+        elif ct == b'PLTE':
+            for i in range(0, len(cd), 3):
+                palette.append((cd[i], cd[i + 1], cd[i + 2]))
+        elif ct == b'IDAT':
+            idat_data.extend(cd)
+        elif ct == b'IEND':
+            break
+        pos += 12 + cl
+
+    assert width is not None, "No IHDR"
+    assert bit_depth == 8, "Unsupported bit depth: %d" % bit_depth
+
+    bpp_map = {2: 3, 6: 4, 3: 1}
+    assert color_type in bpp_map, "Unsupported color type: %d" % color_type
+    bpp = bpp_map[color_type]
+    stride = width * bpp
+
+    raw_filtered = zlib.decompress(bytes(idat_data))
+    expected_size = (stride + 1) * height
+    assert len(raw_filtered) == expected_size, (
+        "Filtered size mismatch: expected %d, got %d" % (expected_size, len(raw_filtered)))
+
+    prev_row = b''
+    mismatches = 0
+    offset = 0
+    for y in range(height):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+
+        for x in range(width):
+            if color_type == 2:
+                off = x * 3
+                actual = (raw_row[off], raw_row[off + 1], raw_row[off + 2])
+            elif color_type == 6:
+                off = x * 4
+                actual = (raw_row[off], raw_row[off + 1], raw_row[off + 2], raw_row[off + 3])
+            else:
+                actual = (raw_row[x],)
+
+            if actual != expected_img.get_pixel(x, y):
+                mismatches += 1
+                if mismatches <= 3:
+                    print("    Pixel mismatch at (%d,%d): expected=%s actual=%s" % (
+                        x, y, expected_img.get_pixel(x, y), actual))
+        prev_row = raw_row
+
+    pal_mismatches = 0
+    if color_type == 3 and expected_palette:
+        assert len(palette) >= len(expected_palette), (
+            "Palette too short: file has %d, expected %d" % (len(palette), len(expected_palette)))
+        for i in range(len(expected_palette)):
+            if palette[i] != expected_palette[i]:
+                pal_mismatches += 1
+                if pal_mismatches <= 3:
+                    print("    Palette mismatch at %d: file=%s expected=%s" % (
+                        i, palette[i], expected_palette[i]))
+
+    return width, height, color_type, mismatches, pal_mismatches
+
+
+def test_file_roundtrip_rgb_zlib_standard():
+    print("=== PNG RGB: write file -> stdlib verify (zlib, zero deps) ===")
+    w, h = 18, 13
+    img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 13 + y * 7) % 256,
+                (y * 11 + x * 5) % 256,
+                ((x ^ y) * 9) % 256,
+            ))
+
+    filepath = '_tmp_rgb.png'
+    try:
+        png_write_file(filepath, img)
+        print("  Written to: %s (%d bytes)" % (filepath, os.path.getsize(filepath)))
+
+        fw, fh, fct, px_mismatch, pal_mismatch = _verify_png_file_zlib(filepath, img)
+        assert fw == w and fh == h, "Dimensions mismatch"
+        assert fct == 2, "Color type mismatch: expected 2, got %d" % fct
+        assert px_mismatch == 0, "%d pixel mismatches" % px_mismatch
+        print("  Dimensions: %dx%d (correct)" % (fw, fh))
+        print("  Color type: %d (RGB, correct)" % fct)
+        print("  Pixels: all %d match" % (w * h))
+        print("  CRC check: all chunks pass")
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+def test_file_roundtrip_rgba_zlib_standard():
+    print("=== PNG RGBA: write file -> stdlib verify (zlib, zero deps) ===")
+    w, h = 14, 9
+    img = PngImage(w, h, 6)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 17 + y * 3) % 256,
+                (y * 13 + x * 7) % 256,
+                ((x * y) * 5) % 256,
+                (128 + (x * 9 + y * 5) % 128),
+            ))
+
+    filepath = '_tmp_rgba.png'
+    try:
+        png_write_file(filepath, img)
+        print("  Written to: %s (%d bytes)" % (filepath, os.path.getsize(filepath)))
+
+        fw, fh, fct, px_mismatch, pal_mismatch = _verify_png_file_zlib(filepath, img)
+        assert fw == w and fh == h, "Dimensions mismatch"
+        assert fct == 6, "Color type mismatch: expected 6, got %d" % fct
+        assert px_mismatch == 0, "%d pixel mismatches" % px_mismatch
+        print("  Dimensions: %dx%d (correct)" % (fw, fh))
+        print("  Color type: %d (RGBA, correct)" % fct)
+        print("  Pixels: all %d match (R+G+B+A)" % (w * h))
+        print("  CRC check: all chunks pass")
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+def test_file_roundtrip_indexed_zlib_standard():
+    print("=== PNG Indexed: write file -> stdlib verify (zlib, zero deps) ===")
+    w, h = 17, 11
+    palette = [((i * 7) % 256, (i * 13) % 256, (i * 29) % 256) for i in range(256)]
+    img = PngImage(w, h, 3, palette=list(palette))
+    for y in range(h):
+        for x in range(w):
+            idx = ((x * 19 + y * 11 + (x * y) * 3) ^ 0x5A) % 256
+            img.set_pixel(x, y, (idx,))
+
+    filepath = '_tmp_indexed.png'
+    try:
+        png_write_file(filepath, img)
+        print("  Written to: %s (%d bytes)" % (filepath, os.path.getsize(filepath)))
+
+        fw, fh, fct, px_mismatch, pal_mismatch = _verify_png_file_zlib(filepath, img, expected_palette=palette)
+        assert fw == w and fh == h, "Dimensions mismatch"
+        assert fct == 3, "Color type mismatch: expected 3, got %d" % fct
+        assert px_mismatch == 0, "%d index mismatches" % px_mismatch
+        assert pal_mismatch == 0, "%d palette mismatches" % pal_mismatch
+        print("  Dimensions: %dx%d (correct)" % (fw, fh))
+        print("  Color type: %d (Indexed, correct)" % fct)
+        print("  Indices: all %d match" % (w * h))
+        print("  Palette: all 256 entries match")
+        print("  CRC check: all chunks pass")
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+def test_file_roundtrip_rgb_pillow():
+    print("=== PNG RGB: write file -> Pillow verify (optional) ===")
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  Pillow not available — SKIPPED (zero-deps path above covers this)\n")
+        return
+
+    w, h = 16, 10
+    img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 15) % 256,
+                (y * 23) % 256,
+                ((x + y) * 11) % 256,
+            ))
+
+    filepath = '_tmp_rgb_pil.png'
+    try:
+        png_write_file(filepath, img)
+        pil_img = Image.open(filepath)
+        assert pil_img.size == (w, h), "Size mismatch"
+        assert pil_img.mode == 'RGB', "Mode mismatch: expected RGB, got %s" % pil_img.mode
+
+        mismatches = 0
+        for y in range(h):
+            for x in range(w):
+                if pil_img.getpixel((x, y)) != img.get_pixel(x, y):
+                    mismatches += 1
+        assert mismatches == 0, "%d pixel mismatches" % mismatches
+        print("  Opened with Pillow: %s mode=%s" % (pil_img.size, pil_img.mode))
+        print("  All %d pixels match" % (w * h))
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+def test_file_roundtrip_rgba_pillow():
+    print("=== PNG RGBA: write file -> Pillow verify (optional) ===")
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  Pillow not available — SKIPPED (zero-deps path above covers this)\n")
+        return
+
+    w, h = 12, 8
+    img = PngImage(w, h, 6)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 19) % 256,
+                (y * 17) % 256,
+                ((x * y) * 7) % 256,
+                (64 + (x * 3 + y * 5) % 192),
+            ))
+
+    filepath = '_tmp_rgba_pil.png'
+    try:
+        png_write_file(filepath, img)
+        pil_img = Image.open(filepath)
+        assert pil_img.size == (w, h), "Size mismatch"
+        assert pil_img.mode == 'RGBA', "Mode mismatch: expected RGBA, got %s" % pil_img.mode
+
+        mismatches = 0
+        for y in range(h):
+            for x in range(w):
+                if pil_img.getpixel((x, y)) != img.get_pixel(x, y):
+                    mismatches += 1
+        assert mismatches == 0, "%d pixel mismatches" % mismatches
+        print("  Opened with Pillow: %s mode=%s" % (pil_img.size, pil_img.mode))
+        print("  All %d pixels match (R+G+B+A)" % (w * h))
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+def test_file_roundtrip_indexed_pillow():
+    print("=== PNG Indexed: write file -> Pillow verify (optional) ===")
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  Pillow not available — SKIPPED (zero-deps path above covers this)\n")
+        return
+
+    w, h = 13, 9
+    palette = [((i * 11) % 256, (i * 17) % 256, (i * 23) % 256) for i in range(256)]
+    img = PngImage(w, h, 3, palette=list(palette))
+    for y in range(h):
+        for x in range(w):
+            idx = ((x * 13 + y * 7) ^ 0x33) % 256
+            img.set_pixel(x, y, (idx,))
+
+    filepath = '_tmp_idx_pil.png'
+    try:
+        png_write_file(filepath, img)
+        pil_img = Image.open(filepath)
+        assert pil_img.size == (w, h), "Size mismatch"
+        assert pil_img.mode == 'P', "Mode mismatch: expected P (palette), got %s" % pil_img.mode
+
+        idx_mismatches = 0
+        for y in range(h):
+            for x in range(w):
+                if pil_img.getpixel((x, y)) != img.get_pixel(x, y)[0]:
+                    idx_mismatches += 1
+        assert idx_mismatches == 0, "%d index mismatches" % idx_mismatches
+
+        pil_palette_raw = pil_img.getpalette()
+        assert pil_palette_raw is not None, "Pillow returned no palette"
+        pil_palette = [(pil_palette_raw[i], pil_palette_raw[i + 1], pil_palette_raw[i + 2])
+                       for i in range(0, 768, 3)]
+        pal_mismatches = 0
+        for i in range(256):
+            if pil_palette[i] != palette[i]:
+                pal_mismatches += 1
+        assert pal_mismatches == 0, "%d palette mismatches" % pal_mismatches
+
+        print("  Opened with Pillow: %s mode=%s" % (pil_img.size, pil_img.mode))
+        print("  All %d indices match" % (w * h))
+        print("  All 256 palette entries match")
+        print("  PASSED\n")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
 def main():
     print("=" * 60)
     print("  Image Format Codec Engine — Round-Trip Verification")
@@ -1100,6 +1410,24 @@ def main():
     test_png_file_level_rgba()
     test_png_file_level_indexed()
     test_png_standard_zlib_compressed_read_all_filters()
+
+    print("=" * 60)
+    print("  Real File Round-Trip (zero deps, write disk -> zlib verify)")
+    print("=" * 60)
+    print()
+
+    test_file_roundtrip_rgb_zlib_standard()
+    test_file_roundtrip_rgba_zlib_standard()
+    test_file_roundtrip_indexed_zlib_standard()
+
+    print("=" * 60)
+    print("  Real File Round-Trip (Pillow optional, when available)")
+    print("=" * 60)
+    print()
+
+    test_file_roundtrip_rgb_pillow()
+    test_file_roundtrip_rgba_pillow()
+    test_file_roundtrip_indexed_pillow()
 
     print("=" * 60)
     print("  Cross-Format Conversion Tests")
