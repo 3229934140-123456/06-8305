@@ -353,7 +353,37 @@ def _raw_rows_to_pixels(rows: List[bytes], width: int, height: int,
     return pixels
 
 
+def _build_default_palette(num_colors: int) -> List[Tuple[int, int, int]]:
+    palette: List[Tuple[int, int, int]] = []
+    n = max(num_colors, 256)
+    for i in range(n):
+        r = (i * 7) % 256
+        g = (i * 13) % 256
+        b = (i * 23) % 256
+        palette.append((r, g, b))
+    return palette[:num_colors]
+
+
+def _ensure_palette(img: PngImage) -> PngImage:
+    if img.color_type != 3:
+        return img
+    if img.palette and len(img.palette) > 0:
+        return img
+
+    max_idx = 0
+    for row in img.pixels:
+        for px in row:
+            if px[0] > max_idx:
+                max_idx = px[0]
+    num_colors = max(max_idx + 1, 256)
+    img.palette = _build_default_palette(num_colors)
+    return img
+
+
 def png_encode(img: PngImage) -> bytes:
+    if img.color_type == 3:
+        _ensure_palette(img)
+
     bpp = _bytes_per_pixel(img.color_type)
 
     raw_rows = _pixels_to_raw_rows(img)
@@ -449,7 +479,7 @@ def png_decode(data: bytes) -> PngImage:
 
     bpp = _bytes_per_pixel(color_type)
 
-    decompressed = zlib_decompress(bytes(idat_data))
+    decompressed = zlib.decompress(bytes(idat_data))
 
     stride = width * bpp
     raw_rows: List[bytes] = []

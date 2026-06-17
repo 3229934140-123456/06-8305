@@ -8,6 +8,7 @@ for both BMP (8/24/32-bit) and PNG (RGB/RGBA/Indexed) formats.
 import os
 import random
 import struct
+import zlib
 
 from bmp_codec import BmpImage, bmp_encode, bmp_decode
 from png_codec import PngImage, png_encode, png_decode
@@ -278,6 +279,301 @@ def test_gradient_image():
     print("  PASSED\n")
 
 
+def test_png_indexed_default_palette():
+    print("=== PNG Indexed Default Palette ===")
+    w, h = 6, 4
+    img = PngImage(w, h, 3)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, ((x + y * w) % 256,))
+
+    assert len(img.palette) == 0, "Palette should be empty before encoding"
+
+    encoded = png_encode(img)
+    decoded = png_decode(encoded)
+
+    assert len(decoded.palette) >= 256, "Default palette should have at least 256 entries"
+    assert decoded.pixels == img.pixels, "Pixel indices should be preserved"
+
+    print("  Created indexed PNG without explicit palette")
+    print("  Auto-generated palette: %d entries" % len(decoded.palette))
+    print("  All pixel indices preserved after round-trip")
+    print("  PASSED\n")
+
+
+def test_bmp_to_png_cross_format():
+    print("=== BMP 24-bit -> PNG RGB -> BMP (Cross-Format) ===")
+    w, h = 8, 6
+
+    bmp = BmpImage(w, h, 24)
+    for y in range(h):
+        for x in range(w):
+            bmp.set_pixel(x, y, (
+                (x * 30) % 256,
+                (y * 40) % 256,
+                ((x * y) * 5) % 256,
+            ))
+
+    bmp_encoded = bmp_encode(bmp)
+    bmp_redecoded = bmp_decode(bmp_encoded)
+    assert bmp_redecoded == bmp, "BMP self round-trip failed"
+
+    png = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            png.set_pixel(x, y, bmp.get_pixel(x, y))
+
+    png_encoded = png_encode(png)
+    png_decoded = png_decode(png_encoded)
+
+    mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            bmp_px = bmp.get_pixel(x, y)
+            png_px = png_decoded.get_pixel(x, y)
+            if bmp_px != png_px:
+                mismatches += 1
+                if mismatches <= 3:
+                    print("  Mismatch at (%d,%d): BMP=%s PNG=%s" % (x, y, bmp_px, png_px))
+
+    assert mismatches == 0, "BMP -> PNG pixel mismatch: %d errors" % mismatches
+    print("  BMP 24-bit <-> PNG RGB: all %d pixels match" % (w * h))
+    print("  PASSED\n")
+
+
+def test_bmp8_to_png_indexed_cross_format():
+    print("=== BMP 8-bit <-> PNG Indexed (Cross-Format) ===")
+    w, h = 7, 5
+
+    palette = [((i * 11) % 256, (i * 17) % 256, (i * 23) % 256) for i in range(256)]
+
+    bmp = BmpImage(w, h, 8, palette=palette)
+    for y in range(h):
+        for x in range(w):
+            idx = (x * 13 + y * 7) % 256
+            bmp.set_pixel(x, y, (idx,))
+
+    bmp_encoded = bmp_encode(bmp)
+    bmp_decoded = bmp_decode(bmp_encoded)
+    assert bmp_decoded == bmp, "BMP 8-bit self round-trip failed"
+
+    png = PngImage(w, h, 3, palette=palette)
+    for y in range(h):
+        for x in range(w):
+            png.set_pixel(x, y, bmp.get_pixel(x, y))
+
+    png_encoded = png_encode(png)
+    png_decoded = png_decode(png_encoded)
+
+    idx_mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            if bmp.get_pixel(x, y) != png_decoded.get_pixel(x, y):
+                idx_mismatches += 1
+
+    pal_mismatches = 0
+    for i in range(min(len(bmp.palette), len(png_decoded.palette))):
+        if bmp.palette[i] != png_decoded.palette[i]:
+            pal_mismatches += 1
+            if pal_mismatches <= 3:
+                print("  Palette mismatch at %d: BMP=%s PNG=%s" % (i, bmp.palette[i], png_decoded.palette[i]))
+
+    assert idx_mismatches == 0, "Index mismatch: %d" % idx_mismatches
+    assert pal_mismatches == 0, "Palette mismatch: %d" % pal_mismatches
+    print("  BMP 8-bit <-> PNG Indexed: indices and palettes match")
+    print("  PASSED\n")
+
+
+def test_png_standard_zlib_interop():
+    print("=== Standard zlib PNG <-> Our Codec (Interop) ===")
+    w, h = 10, 8
+    stride = w * 3
+
+    # Part 1: Generate a PNG with zlib compression, read it with our decoder
+    print("  [1/3] zlib-compressed PNG -> our decoder")
+    raw_filtered = bytearray()
+    for y in range(h):
+        raw_filtered.append(0)
+        for x in range(w):
+            raw_filtered.append((x * 25) % 256)
+            raw_filtered.append((y * 30) % 256)
+            raw_filtered.append(((x + y) * 15) % 256)
+
+    compressed = zlib.compress(bytes(raw_filtered), 9)
+
+    def make_chunk(ctype, cdata):
+        crc_val = zlib.crc32(ctype + cdata) & 0xFFFFFFFF
+        return struct.pack('>I', len(cdata)) + ctype + cdata + struct.pack('>I', crc_val)
+
+    sig = b'\x89PNG\r\n\x1a\n'
+    ihdr = make_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+    idat = make_chunk(b'IDAT', compressed)
+    iend = make_chunk(b'IEND', b'')
+    standard_png = sig + ihdr + idat + iend
+
+    our_decoded = png_decode(standard_png)
+    assert our_decoded.width == w and our_decoded.height == h
+    assert our_decoded.color_type == 2
+
+    mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            expected = ((x * 25) % 256, (y * 30) % 256, ((x + y) * 15) % 256)
+            actual = our_decoded.get_pixel(x, y)
+            if actual != expected:
+                mismatches += 1
+    assert mismatches == 0, "zlib->our decoder: %d pixel mismatches" % mismatches
+    print("    PASS - %dx%d RGB pixels all match" % (w, h))
+
+    # Part 2: Our encoded PNG -> zlib decompress
+    print("  [2/3] our encoder -> zlib.decompress")
+    our_img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            our_img.set_pixel(x, y, ((x * 20) % 256, (y * 25) % 256, ((x * y) * 3) % 256))
+
+    our_encoded = png_encode(our_img)
+
+    pos = 8
+    idat_data = bytearray()
+    while pos < len(our_encoded):
+        cl = struct.unpack('>I', our_encoded[pos:pos + 4])[0]
+        ct = our_encoded[pos + 4:pos + 8]
+        cd = our_encoded[pos + 8:pos + 8 + cl]
+        if ct == b'IDAT':
+            idat_data.extend(cd)
+        elif ct == b'IEND':
+            break
+        pos += 12 + cl
+
+    zlib_decoded = zlib.decompress(bytes(idat_data))
+    expected_size = (stride + 1) * h
+    assert len(zlib_decoded) == expected_size, "zlib decompressed size mismatch"
+    print("    PASS - %d bytes filtered data decompressed by zlib" % len(zlib_decoded))
+
+    # Part 3: Our encoded PNG -> our decoded -> pixel match with expected
+    print("  [3/3] our encoder -> our decoder (sanity)")
+    our_redecoded = png_decode(our_encoded)
+    assert our_redecoded == our_img
+    print("    PASS - round-trip pixel-perfect")
+
+    print("  PASSED\n")
+
+
+def test_png_pillow_interop():
+    print("=== Pillow PNG Interop ===")
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  Pillow not installed, skipping")
+        print("  SKIPPED\n")
+        return
+
+    w, h = 12, 9
+
+    # Part 1: Our PNG -> Pillow
+    print("  [1/2] our PNG -> Pillow")
+    our_img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            our_img.set_pixel(x, y, ((x * 20) % 256, (y * 25) % 256, ((x + y) * 10) % 256))
+
+    our_encoded = png_encode(our_img)
+    import io
+    pil_img = Image.open(io.BytesIO(our_encoded))
+    assert pil_img.size == (w, h)
+    assert pil_img.mode == 'RGB'
+
+    mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            if pil_img.getpixel((x, y)) != our_img.get_pixel(x, y):
+                mismatches += 1
+    assert mismatches == 0, "Pillow read mismatch: %d" % mismatches
+    print("    PASS - Pillow reads our PNG correctly")
+
+    # Part 2: Pillow PNG -> our decoder
+    print("  [2/2] Pillow PNG -> our decoder")
+    pil_img2 = Image.new('RGB', (w, h))
+    for y in range(h):
+        for x in range(w):
+            pil_img2.putpixel((x, y), ((x * 15) % 256, (y * 20) % 256, 128))
+
+    buf = io.BytesIO()
+    pil_img2.save(buf, 'PNG')
+    pillow_png = buf.getvalue()
+
+    our_decoded = png_decode(pillow_png)
+    assert our_decoded.width == w and our_decoded.height == h
+
+    mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            expected = pil_img2.getpixel((x, y))
+            actual = our_decoded.get_pixel(x, y)
+            if actual != expected:
+                mismatches += 1
+    assert mismatches == 0, "Our decoder read mismatch: %d" % mismatches
+    print("    PASS - Our decoder reads Pillow PNG correctly")
+
+    print("  PASSED\n")
+
+
+def test_png_indexed_standard_zlib():
+    print("=== Standard zlib Indexed PNG <-> Our Codec ===")
+    w, h = 8, 6
+    stride = w * 1
+
+    palette = [((i * 8) % 256, (i * 12) % 256, (i * 16) % 256) for i in range(256)]
+
+    # Build a standard indexed PNG with zlib compression
+    raw_filtered = bytearray()
+    for y in range(h):
+        raw_filtered.append(0)
+        for x in range(w):
+            raw_filtered.append((x + y * 3) % 256)
+
+    compressed = zlib.compress(bytes(raw_filtered), 9)
+
+    import struct
+
+    def make_chunk(ctype, cdata):
+        crc_val = zlib.crc32(ctype + cdata) & 0xFFFFFFFF
+        return struct.pack('>I', len(cdata)) + ctype + cdata + struct.pack('>I', crc_val)
+
+    sig = b'\x89PNG\r\n\x1a\n'
+    ihdr = make_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 3, 0, 0, 0))
+    plte_data = bytearray()
+    for r, g, b in palette[:256]:
+        plte_data.extend([r, g, b])
+    plte = make_chunk(b'PLTE', bytes(plte_data))
+    idat = make_chunk(b'IDAT', compressed)
+    iend = make_chunk(b'IEND', b'')
+    standard_png = sig + ihdr + plte + idat + iend
+
+    our_decoded = png_decode(standard_png)
+    assert our_decoded.color_type == 3
+    assert len(our_decoded.palette) == 256
+
+    idx_mismatches = 0
+    for y in range(h):
+        for x in range(w):
+            expected_idx = (x + y * 3) % 256
+            actual_idx = our_decoded.get_pixel(x, y)[0]
+            if actual_idx != expected_idx:
+                idx_mismatches += 1
+
+    pal_mismatches = 0
+    for i in range(256):
+        if our_decoded.palette[i] != palette[i]:
+            pal_mismatches += 1
+
+    assert idx_mismatches == 0, "Index mismatches: %d" % idx_mismatches
+    assert pal_mismatches == 0, "Palette mismatches: %d" % pal_mismatches
+    print("  Standard indexed PNG read by our decoder: all indices + palette match")
+    print("  PASSED\n")
+
+
 def main():
     print("=" * 60)
     print("  Image Format Codec Engine — Round-Trip Verification")
@@ -292,10 +588,22 @@ def main():
     test_png_rgb_roundtrip()
     test_png_rgba_roundtrip()
     test_png_indexed_roundtrip()
+    test_png_indexed_default_palette()
     test_png_chunk_crc()
     test_png_filters()
     test_large_image_roundtrip()
     test_gradient_image()
+
+    print("=" * 60)
+    print("  Cross-Format & Standard Interoperability Tests")
+    print("=" * 60)
+    print()
+
+    test_bmp_to_png_cross_format()
+    test_bmp8_to_png_indexed_cross_format()
+    test_png_standard_zlib_interop()
+    test_png_indexed_standard_zlib()
+    test_png_pillow_interop()
 
     print("=" * 60)
     print("  ALL TESTS PASSED")
