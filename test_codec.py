@@ -574,6 +574,494 @@ def test_png_indexed_standard_zlib():
     print("  PASSED\n")
 
 
+def _paeth_predictor(a, b, c):
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    elif pb <= pc:
+        return b
+    else:
+        return c
+
+
+def _unfilter_row(filter_type, filtered_row, prev_row, bpp):
+    out = bytearray(len(filtered_row))
+    for i in range(len(filtered_row)):
+        fx = filtered_row[i]
+        a = out[i - bpp] if i >= bpp else 0
+        b = prev_row[i] if prev_row else 0
+        c = (prev_row[i - bpp] if prev_row and i >= bpp else 0)
+        if filter_type == 0:
+            out[i] = fx
+        elif filter_type == 1:
+            out[i] = (fx + a) & 0xFF
+        elif filter_type == 2:
+            out[i] = (fx + b) & 0xFF
+        elif filter_type == 3:
+            out[i] = (fx + ((a + b) >> 1)) & 0xFF
+        elif filter_type == 4:
+            out[i] = (fx + _paeth_predictor(a, b, c)) & 0xFF
+    return bytes(out)
+
+
+def _extract_idat_from_png(png_data):
+    pos = 8
+    idat_data = bytearray()
+    while pos < len(png_data):
+        cl = struct.unpack('>I', png_data[pos:pos + 4])[0]
+        ct = png_data[pos + 4:pos + 8]
+        cd = png_data[pos + 8:pos + 8 + cl]
+        if ct == b'IDAT':
+            idat_data.extend(cd)
+        elif ct == b'IEND':
+            break
+        pos += 12 + cl
+    return bytes(idat_data)
+
+
+def _extract_ihdr_from_png(png_data):
+    pos = 8
+    while pos < len(png_data):
+        cl = struct.unpack('>I', png_data[pos:pos + 4])[0]
+        ct = png_data[pos + 4:pos + 8]
+        cd = png_data[pos + 8:pos + 8 + cl]
+        if ct == b'IHDR':
+            w = struct.unpack('>I', cd[0:4])[0]
+            h = struct.unpack('>I', cd[4:8])[0]
+            bd = cd[8]
+            ct_val = cd[9]
+            return w, h, bd, ct_val
+        pos += 12 + cl
+    raise ValueError("No IHDR chunk")
+
+
+def _extract_plte_from_png(png_data):
+    pos = 8
+    while pos < len(png_data):
+        cl = struct.unpack('>I', png_data[pos:pos + 4])[0]
+        ct = png_data[pos + 4:pos + 8]
+        cd = png_data[pos + 8:pos + 8 + cl]
+        if ct == b'PLTE':
+            palette = []
+            for i in range(0, len(cd), 3):
+                palette.append((cd[i], cd[i + 1], cd[i + 2]))
+            return palette
+        elif ct == b'IDAT':
+            break
+        pos += 12 + cl
+    return []
+
+
+def test_png_idat_zlib_decompress_rgb():
+    print("=== Our PNG IDAT + zlib.decompress -> Pixels (RGB) ===")
+    w, h = 12, 9
+    bpp = 3
+    stride = w * bpp
+
+    img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 21) % 256,
+                (y * 17) % 256,
+                ((x * y) * 3) % 256,
+            ))
+
+    png_data = png_encode(img)
+
+    idat_data = _extract_idat_from_png(png_data)
+    raw_filtered = zlib.decompress(idat_data)
+
+    expected_size = (stride + 1) * h
+    assert len(raw_filtered) == expected_size, (
+        "Filtered data size mismatch: expected %d, got %d" % (expected_size, len(raw_filtered)))
+    print("  IDAT size: %d bytes -> filtered: %d bytes" % (len(idat_data), len(raw_filtered)))
+
+    prev_row = b''
+    mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+
+        for x in range(w):
+            off = x * bpp
+            actual = (raw_row[off], raw_row[off + 1], raw_row[off + 2])
+            expected = img.get_pixel(x, y)
+            if actual != expected:
+                mismatches += 1
+                if mismatches <= 3:
+                    print("    Mismatch at (%d,%d): expected=%s actual=%s" % (x, y, expected, actual))
+
+        prev_row = raw_row
+
+    assert mismatches == 0, "%d pixel mismatches" % mismatches
+    print("  All %d×%d = %d RGB pixels match after zlib decompress + manual unfilter" % (w, h, w * h))
+    print("  PASSED\n")
+
+
+def test_png_idat_zlib_decompress_rgba():
+    print("=== Our PNG IDAT + zlib.decompress -> Pixels (RGBA) ===")
+    w, h = 10, 7
+    bpp = 4
+    stride = w * bpp
+
+    img = PngImage(w, h, 6)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 25) % 256,
+                (y * 19) % 256,
+                ((x + y) * 11) % 256,
+                ((x * y) * 5) % 256,
+            ))
+
+    png_data = png_encode(img)
+
+    idat_data = _extract_idat_from_png(png_data)
+    raw_filtered = zlib.decompress(idat_data)
+
+    expected_size = (stride + 1) * h
+    assert len(raw_filtered) == expected_size, (
+        "Filtered data size mismatch: expected %d, got %d" % (expected_size, len(raw_filtered)))
+    print("  IDAT size: %d bytes -> filtered: %d bytes" % (len(idat_data), len(raw_filtered)))
+
+    prev_row = b''
+    mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+
+        for x in range(w):
+            off = x * bpp
+            actual = (raw_row[off], raw_row[off + 1], raw_row[off + 2], raw_row[off + 3])
+            expected = img.get_pixel(x, y)
+            if actual != expected:
+                mismatches += 1
+                if mismatches <= 3:
+                    print("    Mismatch at (%d,%d): expected=%s actual=%s" % (x, y, expected, actual))
+
+        prev_row = raw_row
+
+    assert mismatches == 0, "%d pixel mismatches" % mismatches
+    print("  All %d×%d = %d RGBA pixels match after zlib decompress + manual unfilter" % (w, h, w * h))
+    print("  PASSED\n")
+
+
+def test_png_idat_zlib_decompress_indexed():
+    print("=== Our PNG IDAT + zlib.decompress -> Pixels (Indexed/Palette) ===")
+    w, h = 14, 10
+    bpp = 1
+    stride = w * bpp
+
+    palette = [((i * 7) % 256, (i * 13) % 256, (i * 23) % 256) for i in range(256)]
+    img = PngImage(w, h, 3, palette=palette)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (((x * 13 + y * 7) * 5) % 256,))
+
+    png_data = png_encode(img)
+
+    idat_data = _extract_idat_from_png(png_data)
+    raw_filtered = zlib.decompress(idat_data)
+
+    expected_size = (stride + 1) * h
+    assert len(raw_filtered) == expected_size, (
+        "Filtered data size mismatch: expected %d, got %d" % (expected_size, len(raw_filtered)))
+    print("  IDAT size: %d bytes -> filtered: %d bytes" % (len(idat_data), len(raw_filtered)))
+
+    plte = _extract_plte_from_png(png_data)
+    assert len(plte) >= 256, "Palette too short: %d entries" % len(plte)
+    print("  PLTE extracted: %d entries" % len(plte))
+
+    prev_row = b''
+    idx_mismatches = 0
+    pal_mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+
+        for x in range(w):
+            actual_idx = raw_row[x]
+            expected_idx = img.get_pixel(x, y)[0]
+            if actual_idx != expected_idx:
+                idx_mismatches += 1
+
+        prev_row = raw_row
+
+    for i in range(min(len(palette), len(plte))):
+        if palette[i] != plte[i]:
+            pal_mismatches += 1
+            if pal_mismatches <= 3:
+                print("    Palette mismatch at %d: expected=%s actual=%s" % (i, palette[i], plte[i]))
+
+    assert idx_mismatches == 0, "%d index mismatches" % idx_mismatches
+    assert pal_mismatches == 0, "%d palette mismatches" % pal_mismatches
+    print("  All %d×%d = %d indices + 256 palette entries match after zlib decompress" % (w, h, w * h))
+    print("  PASSED\n")
+
+
+def test_png_file_level_rgb():
+    print("=== File-Level Interop: RGB PNG (write + read back with zlib) ===")
+    w, h = 16, 12
+
+    img = PngImage(w, h, 2)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 16) % 256,
+                (y * 20) % 256,
+                ((x ^ y) * 7) % 256,
+            ))
+
+    png_data = png_encode(img)
+
+    assert png_data[:8] == b'\x89PNG\r\n\x1a\n', "Invalid PNG signature"
+    print("  Signature: OK")
+
+    width, height, bit_depth, color_type = _extract_ihdr_from_png(png_data)
+    assert width == w and height == h
+    assert bit_depth == 8
+    assert color_type == 2
+    print("  IHDR: %dx%d, 8-bit, color type 2 (RGB) — OK" % (width, height))
+
+    idat_data = _extract_idat_from_png(png_data)
+    assert len(idat_data) > 0, "No IDAT data"
+    print("  IDAT: %d bytes" % len(idat_data))
+
+    raw_filtered = zlib.decompress(idat_data)
+    expected_size = (w * 3 + 1) * h
+    assert len(raw_filtered) == expected_size, "Filtered size mismatch"
+    print("  Decompressed: %d bytes (expected %d) — OK" % (len(raw_filtered), expected_size))
+
+    prev_row = b''
+    bpp = 3
+    stride = w * bpp
+    mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+        for x in range(w):
+            off = x * 3
+            px = (raw_row[off], raw_row[off + 1], raw_row[off + 2])
+            if px != img.get_pixel(x, y):
+                mismatches += 1
+        prev_row = raw_row
+
+    assert mismatches == 0, "%d pixel mismatches" % mismatches
+    print("  Pixels: all %d match — OK" % (w * h))
+    print("  PASSED\n")
+
+
+def test_png_file_level_rgba():
+    print("=== File-Level Interop: RGBA PNG (write + read back with zlib) ===")
+    w, h = 11, 8
+
+    img = PngImage(w, h, 6)
+    for y in range(h):
+        for x in range(w):
+            img.set_pixel(x, y, (
+                (x * 23) % 256,
+                (y * 29) % 256,
+                ((x + y) * 13) % 256,
+                128 + (x * 5 + y * 3) % 128,
+            ))
+
+    png_data = png_encode(img)
+
+    assert png_data[:8] == b'\x89PNG\r\n\x1a\n', "Invalid PNG signature"
+    print("  Signature: OK")
+
+    width, height, bit_depth, color_type = _extract_ihdr_from_png(png_data)
+    assert width == w and height == h
+    assert bit_depth == 8
+    assert color_type == 6
+    print("  IHDR: %dx%d, 8-bit, color type 6 (RGBA) — OK" % (width, height))
+
+    idat_data = _extract_idat_from_png(png_data)
+    assert len(idat_data) > 0, "No IDAT data"
+    print("  IDAT: %d bytes" % len(idat_data))
+
+    raw_filtered = zlib.decompress(idat_data)
+    expected_size = (w * 4 + 1) * h
+    assert len(raw_filtered) == expected_size, "Filtered size mismatch"
+    print("  Decompressed: %d bytes (expected %d) — OK" % (len(raw_filtered), expected_size))
+
+    prev_row = b''
+    bpp = 4
+    stride = w * bpp
+    mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+        for x in range(w):
+            off = x * 4
+            px = (raw_row[off], raw_row[off + 1], raw_row[off + 2], raw_row[off + 3])
+            if px != img.get_pixel(x, y):
+                mismatches += 1
+        prev_row = raw_row
+
+    assert mismatches == 0, "%d pixel mismatches" % mismatches
+    print("  Pixels: all %d match — OK" % (w * h))
+    print("  PASSED\n")
+
+
+def test_png_file_level_indexed():
+    print("=== File-Level Interop: Indexed PNG (write + read back with zlib) ===")
+    w, h = 15, 10
+
+    palette = [((i * 11) % 256, (i * 17) % 256, (i * 29) % 256) for i in range(256)]
+    img = PngImage(w, h, 3, palette=palette)
+    for y in range(h):
+        for x in range(w):
+            idx = (x * 17 + y * 11 + (x * y) * 3) % 256
+            img.set_pixel(x, y, (idx,))
+
+    png_data = png_encode(img)
+
+    assert png_data[:8] == b'\x89PNG\r\n\x1a\n', "Invalid PNG signature"
+    print("  Signature: OK")
+
+    width, height, bit_depth, color_type = _extract_ihdr_from_png(png_data)
+    assert width == w and height == h
+    assert bit_depth == 8
+    assert color_type == 3
+    print("  IHDR: %dx%d, 8-bit, color type 3 (Indexed) — OK" % (width, height))
+
+    plte = _extract_plte_from_png(png_data)
+    assert len(plte) == 256, "Expected 256 palette entries, got %d" % len(plte)
+    pal_mismatches = 0
+    for i in range(256):
+        if plte[i] != palette[i]:
+            pal_mismatches += 1
+    assert pal_mismatches == 0, "%d palette mismatches" % pal_mismatches
+    print("  PLTE: 256 entries, all match — OK")
+
+    idat_data = _extract_idat_from_png(png_data)
+    assert len(idat_data) > 0, "No IDAT data"
+    print("  IDAT: %d bytes" % len(idat_data))
+
+    raw_filtered = zlib.decompress(idat_data)
+    expected_size = (w * 1 + 1) * h
+    assert len(raw_filtered) == expected_size, "Filtered size mismatch"
+    print("  Decompressed: %d bytes (expected %d) — OK" % (len(raw_filtered), expected_size))
+
+    prev_row = b''
+    bpp = 1
+    stride = w * bpp
+    idx_mismatches = 0
+    offset = 0
+    for y in range(h):
+        ft = raw_filtered[offset]
+        offset += 1
+        filtered_row = raw_filtered[offset:offset + stride]
+        offset += stride
+        raw_row = _unfilter_row(ft, filtered_row, prev_row, bpp)
+        for x in range(w):
+            if raw_row[x] != img.get_pixel(x, y)[0]:
+                idx_mismatches += 1
+        prev_row = raw_row
+
+    assert idx_mismatches == 0, "%d index mismatches" % idx_mismatches
+    print("  Indices: all %d match — OK" % (w * h))
+    print("  PASSED\n")
+
+
+def test_png_standard_zlib_compressed_read_all_filters():
+    print("=== Standard zlib PNG (all 5 filters) -> Our Decoder ===")
+    w, h = 5, 6
+    bpp = 3
+    stride = w * bpp
+
+    from png_codec import (
+        FILTER_NONE, FILTER_SUB, FILTER_UP, FILTER_AVERAGE, FILTER_PAETH
+    )
+
+    def make_filtered_png(filter_byte):
+        raw_rows = []
+        for y in range(h):
+            row = bytearray()
+            for x in range(w):
+                row.append((x * 50 + y * 10) % 256)
+                row.append((y * 40 + x * 5) % 256)
+                row.append((x + y) * 20 % 256)
+            raw_rows.append(bytes(row))
+
+        from png_codec import _filter_row
+        raw_filtered = bytearray()
+        prev_row = b''
+        for row in raw_rows:
+            raw_filtered.append(filter_byte)
+            filt_row = _filter_row(filter_byte, row, prev_row, bpp)
+            raw_filtered.extend(filt_row)
+            prev_row = row
+
+        compressed = zlib.compress(bytes(raw_filtered), 9)
+
+        def make_chunk(ctype, cdata):
+            crc_val = zlib.crc32(ctype + cdata) & 0xFFFFFFFF
+            return struct.pack('>I', len(cdata)) + ctype + cdata + struct.pack('>I', crc_val)
+
+        sig = b'\x89PNG\r\n\x1a\n'
+        ihdr = make_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+        idat = make_chunk(b'IDAT', compressed)
+        iend = make_chunk(b'IEND', b'')
+        return sig + ihdr + idat + iend
+
+    filter_names = {
+        FILTER_NONE: "None",
+        FILTER_SUB: "Sub",
+        FILTER_UP: "Up",
+        FILTER_AVERAGE: "Average",
+        FILTER_PAETH: "Paeth",
+    }
+
+    for ft, name in sorted(filter_names.items()):
+        png_data = make_filtered_png(ft)
+        decoded = png_decode(png_data)
+        assert decoded.width == w and decoded.height == h
+        assert decoded.color_type == 2
+
+        mismatches = 0
+        for y in range(h):
+            for x in range(w):
+                expected = (
+                    (x * 50 + y * 10) % 256,
+                    (y * 40 + x * 5) % 256,
+                    (x + y) * 20 % 256,
+                )
+                actual = decoded.get_pixel(x, y)
+                if actual != expected:
+                    mismatches += 1
+        assert mismatches == 0, "Filter %s: %d mismatches" % (name, mismatches)
+        print("  Filter %s: OK" % name)
+
+    print("  All 5 filter types decoded correctly from zlib-compressed PNG")
+    print("  PASSED\n")
+
+
 def main():
     print("=" * 60)
     print("  Image Format Codec Engine — Round-Trip Verification")
@@ -595,7 +1083,26 @@ def main():
     test_gradient_image()
 
     print("=" * 60)
-    print("  Cross-Format & Standard Interoperability Tests")
+    print("  Standard Library Interop (IDAT via zlib.decompress)")
+    print("=" * 60)
+    print()
+
+    test_png_idat_zlib_decompress_rgb()
+    test_png_idat_zlib_decompress_rgba()
+    test_png_idat_zlib_decompress_indexed()
+
+    print("=" * 60)
+    print("  File-Level Interop (full PNG structure + zlib)")
+    print("=" * 60)
+    print()
+
+    test_png_file_level_rgb()
+    test_png_file_level_rgba()
+    test_png_file_level_indexed()
+    test_png_standard_zlib_compressed_read_all_filters()
+
+    print("=" * 60)
+    print("  Cross-Format Conversion Tests")
     print("=" * 60)
     print()
 
